@@ -1,2 +1,6 @@
 /images
 /.vagrant
+
+# local build artifacts of the aa-srcd package
+aa_wireless_dongle/package/aa-srcd/aa-srcd
+aa_wireless_dongle/package/aa-srcd/src/*.o

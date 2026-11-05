@@ -1,0 +1,7 @@
+# Everything in this repo ends up inside a Linux image (shell scripts, configs,
+# kernel patches, C++ sources). CRLF checkouts silently break busybox ash scripts
+# and inject trailing \r into sourced config files, so force LF on every platform.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
