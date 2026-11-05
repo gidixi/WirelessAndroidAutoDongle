@@ -88,6 +88,15 @@ ConnectionStrategy Config::getConnectionStrategy() {
 
     return connectionStrategy.value();
 }
+
+bool Config::getCaptureEnabled() {
+    return getenv("AAWG_CAPTURE_FRAMES", 0) != 0;
+}
+
+std::string Config::getCaptureDirectory() {
+    return getenv("AAWG_CAPTURE_DIR", "/var/log/aawgd");
+}
+
 #pragma endregion Config
 
 #pragma region Logger

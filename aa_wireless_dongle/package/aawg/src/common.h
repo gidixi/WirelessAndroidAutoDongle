@@ -30,6 +30,9 @@ public:
     WifiInfo getWifiInfo();
     ConnectionStrategy getConnectionStrategy();
 
+    bool getCaptureEnabled();
+    std::string getCaptureDirectory();
+
     std::string getUniqueSuffix();
 private:
     Config() = default;

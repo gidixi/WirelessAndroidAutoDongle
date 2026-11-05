@@ -15,6 +15,7 @@
 #include "usb.h"
 #include "bluetoothHandler.h"
 #include "proxyHandler.h"
+#include "frameDump.h"
 
 void empty_signal_handler(int signal) {
     // Empty. We don't want to do anything but interrupt the thread.
@@ -93,6 +94,15 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
             break;
     }
 
+    std::optional<FrameRecorder> recorder;
+    if (Config::instance()->getCaptureEnabled()) {
+        FrameRecorder::Direction captureDirection = direction == ProxyDirection::TCP_to_USB
+            ? FrameRecorder::Direction::FROM_PHONE
+            : FrameRecorder::Direction::FROM_HEADUNIT;
+
+        recorder.emplace(captureDirection, Config::instance()->getCaptureDirectory());
+    }
+
     while (!should_exit) {
         // Read
         ssize_t len = read_message ? readMessage(read_fd, buffer, buffer_len) : read(read_fd, buffer, buffer_len);
@@ -114,6 +124,11 @@ void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit)
         }
         else if (should_exit) {
             break;
+        }
+
+        // Record what we just read, if the capture is enabled
+        if (recorder) {
+            recorder->append(buffer, len);
         }
 
         // Write
