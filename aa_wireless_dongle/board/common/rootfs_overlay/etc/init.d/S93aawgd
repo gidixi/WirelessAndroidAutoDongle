@@ -16,6 +16,15 @@ case "$1" in
 			source /etc/aawgd.conf
 		fi
 
+		# aa-srcd needs the same accessory device, so only one of the two runs.
+		if [ -f /etc/aa-srcd.conf ]; then
+			source /etc/aa-srcd.conf
+		fi
+		if [ "$AA_SRC_ENABLED" = "1" ]; then
+			echo "aa-srcd owns the accessory device, not starting $DAEMON"
+			exit 0
+		fi
+
 		printf "Starting $DAEMON: "
 		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/usr/bin/$DAEMON"
 		RETVAL=$?

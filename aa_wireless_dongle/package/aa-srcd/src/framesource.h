@@ -40,6 +40,24 @@ private:
     size_t m_next = 0;
 };
 
+// Everything the dashboard may show besides its own clock. The head unit pushes
+// the sensor values over the sensor channel; the daemon owns the lifetime.
+struct DashboardState {
+    bool nightMode = false;
+    int drivingStatus = -1;             // -1 unknown, otherwise the DrivingStatus enum value
+    int videoWidth = 0;
+    int videoHeight = 0;
+    int videoFps = 0;
+    uint64_t sessionStartMs = 0;
+};
+
+struct RenderContext {
+    int width = 0;
+    int height = 0;
+    uint64_t frameIndex = 0;
+    const DashboardState* state = nullptr;
+};
+
 // Surface the UI toolkit draws into: 32 bit ARGB, top-down rows.
 // This is where LVGL / Dear ImGui / Qt plug in: they all can render into a
 // caller supplied buffer without any window system.
@@ -47,20 +65,21 @@ class Renderer {
 public:
     virtual ~Renderer() = default;
 
-    virtual void draw(uint8_t* argb, int width, int height, uint64_t frameIndex) = 0;
+    // argb points at a width*4 pitch, top-down, 0xAARRGGBB in memory as B,G,R,A.
+    virtual void draw(uint8_t* argb, const RenderContext& context) = 0;
 };
 
 // Stand-in renderer used until a real UI toolkit is wired up: proves the live
 // pipeline moves pixels (moving bar, colour blocks, animated counter).
 class TestPatternRenderer: public Renderer {
 public:
-    void draw(uint8_t* argb, int width, int height, uint64_t frameIndex) override;
+    void draw(uint8_t* argb, const RenderContext& context) override;
 };
 
 // Live path: render with Renderer, encode with libx264.
 class LiveEncodeSource: public FrameSource {
 public:
-    LiveEncodeSource(int width, int height, int fps, int bitrateKbps, Renderer& renderer);
+    LiveEncodeSource(int width, int height, int fps, int bitrateKbps, Renderer& renderer, const DashboardState& state);
     ~LiveEncodeSource() override;
 
     bool nextPicture(std::vector<uint8_t>& annexB, bool& keyframe) override;

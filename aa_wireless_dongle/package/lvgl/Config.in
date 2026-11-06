@@ -1,0 +1,8 @@
+config BR2_PACKAGE_LVGL
+	bool "lvgl"
+	help
+	  Light and Versatile Graphics Library, compiled here as a static library
+	  with our own lv_conf.h and only the software renderer. Used by aa-srcd
+	  to draw the dashboard that gets projected over Android Auto.
+
+	  https://lvgl.io

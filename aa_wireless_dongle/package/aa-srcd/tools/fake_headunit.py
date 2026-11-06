@@ -199,8 +199,12 @@ class HeadUnit:
 
 
 def build_service_discovery_response():
-    video_config = field_varint(1, 1) + field_varint(2, 1) + field_varint(5, 140)   # 800x480, 30fps, 140dpi
-    av_channel = field_bytes(4, video_config) + field_varint(1, 3)                  # H264 baseline
+    # Two display modes, deliberately not in the order a naive source would pick:
+    # taking the first advertised one gives the wrong size.
+    mode_720p = field_varint(1, 2) + field_varint(2, 2) + field_varint(3, 60) + field_varint(4, 30) + field_varint(5, 200)
+    mode_wvga = field_varint(1, 1) + field_varint(2, 2) + field_varint(3, 40) + field_varint(4, 20) + field_varint(5, 140)
+    av_channel = (field_bytes(4, mode_720p) + field_bytes(4, mode_wvga)          # 1280x720 then 800x480, 30fps
+                  + field_varint(1, 3))                                          # H264 baseline
     sensor_channel = field_varint(1, 13) + field_varint(1, 10)                      # driving status, night mode
     input_channel = field_varint(1, 3) + field_varint(1, 4)                         # HOME, BACK keycodes
 
@@ -226,6 +230,8 @@ def main():
     parser.add_argument("--ca", required=True)
     parser.add_argument("--frames", type=int, default=20)
     parser.add_argument("--save", help="write the received video stream to this file")
+    parser.add_argument("--mode-index", type=int, default=0,
+                        help="which advertised display mode the head unit confirms in its AV setup response")
     args = parser.parse_args()
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
@@ -269,7 +275,8 @@ def main():
 
     channel, _, body = unit.wait_for(3, AV_SETUP_REQUEST)
     print(f"[hu] AV setup request: codec={body[1] & 0x7F}")
-    unit.send_message(3, AV_SETUP_RESPONSE, field_varint(1, 2) + field_varint(2, 8) + field_varint(3, 0),
+    unit.send_message(3, AV_SETUP_RESPONSE,
+                      field_varint(1, 2) + field_varint(2, 8) + field_varint(3, args.mode_index),
                       control=False, encrypted=True)
 
     _, _, body = unit.wait_for(3, AV_START_INDICATION)

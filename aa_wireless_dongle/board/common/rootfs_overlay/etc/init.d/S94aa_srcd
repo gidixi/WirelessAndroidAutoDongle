@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# Start aa-srcd: the Pi itself as Android Auto source.
+# Disabled until AA_SRC_ENABLED=1; enabling it keeps aawgd from starting, since
+# both want /dev/usb_accessory.
+
+DAEMON="aa-srcd"
+PIDFILE="/var/run/$DAEMON.pid"
+LOGFILE="/var/log/$DAEMON.log"
+
+RETVAL=0
+
+case "$1" in
+	start)
+		if [ -z "$AA_SRC_CONF_SOURCED" ]; then
+			echo "Source /etc/aa-srcd.conf"
+			source /etc/aa-srcd.conf
+		fi
+
+		if [ "$AA_SRC_ENABLED" != "1" ]; then
+			exit 0
+		fi
+
+		if [ "$AA_SRC_LIVE" = "1" ]; then
+			ARGS="--live --ui ${AA_SRC_UI:-lvgl} --bitrate ${AA_SRC_BITRATE:-800}"
+		else
+			ARGS="--h264 ${AA_SRC_VIDEO:-/persist/aa-srcd/dashboard.h264}"
+		fi
+
+		ARGS="$ARGS --fps ${AA_SRC_FPS:-5}"
+		if [ "$AA_SRC_DEBUG" = "1" ]; then
+			ARGS="$ARGS --debug"
+		fi
+
+		printf "Starting $DAEMON: "
+		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x /bin/sh -- \
+			-c "exec /usr/bin/$DAEMON $ARGS >> $LOGFILE 2>&1"
+		RETVAL=$?
+		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
+		;;
+	stop)
+		printf "Stopping $DAEMON: "
+		start-stop-daemon -K -q -p "$PIDFILE"
+		RETVAL=$?
+		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
+		;;
+	restart)
+		$0 stop
+		$0 start
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		;;
+esac
+
+exit $RETVAL

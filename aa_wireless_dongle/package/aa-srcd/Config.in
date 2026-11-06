@@ -2,6 +2,11 @@ config BR2_PACKAGE_AA_SRCD
 	bool "aa-srcd"
 	select BR2_PACKAGE_OPENSSL
 	select BR2_PACKAGE_X264
+	select BR2_PACKAGE_LVGL
 	help
-	  Android Auto source daemon: projects its own video stream
-	  (a dashboard by default) on a head unit, with no phone involved.
+	  Android Auto source daemon: the Raspberry Pi plays the role of the
+	  phone and projects its own video (an LVGL dashboard, or a pre-encoded
+	  H.264 stream) on a head unit, with no phone involved.
+
+	  Enable it with AA_SRC_ENABLED=1 in /etc/aa-srcd.conf; that also turns
+	  off the aawgd proxy, since both want the USB accessory device.

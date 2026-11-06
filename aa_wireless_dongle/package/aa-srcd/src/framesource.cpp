@@ -128,7 +128,10 @@ namespace {
     }
 }
 
-void TestPatternRenderer::draw(uint8_t* argb, int width, int height, uint64_t frameIndex) {
+void TestPatternRenderer::draw(uint8_t* argb, const RenderContext& context) {
+    int width = context.width;
+    int height = context.height;
+    uint64_t frameIndex = context.frameIndex;
     int pitch = width * 4;
 
     // Dark blue gradient background: cheap to encode, obviously not a test card.
@@ -185,8 +188,8 @@ static void convertArgbToI420(const std::vector<uint8_t>& argb, uint8_t** plane,
             int green = ((upper[o + 1] + upper[o + 5] + lower[o + 1] + lower[o + 5]) + 2) / 4;
             int blue = ((upper[o] + upper[o + 4] + lower[o] + lower[o + 4]) + 2) / 4;
 
-            chromaU[x] = (uint8_t)((-43 * red - 85 * green + 128 * blue + 128) >> 8);
-            chromaV[x] = (uint8_t)((128 * red - 107 * green - 21 * blue + 128) >> 8);
+            chromaU[x] = (uint8_t)((-43 * red - 85 * green + 128 * blue + 32768) >> 8);
+            chromaV[x] = (uint8_t)((128 * red - 107 * green - 21 * blue + 32768) >> 8);
         }
     }
 }
@@ -195,6 +198,7 @@ struct LiveEncodeSource::Impl {
     int width = 0;
     int height = 0;
     Renderer& renderer;
+    const DashboardState& state;
     uint64_t frameIndex = 0;
 
 #ifdef AA_SRCD_HAVE_X264
@@ -206,7 +210,7 @@ struct LiveEncodeSource::Impl {
     bool allocated = false;
 #endif
 
-    Impl(Renderer& rendererRef): renderer(rendererRef) {}
+    Impl(Renderer& rendererRef, const DashboardState& stateRef): renderer(rendererRef), state(stateRef) {}
 };
 
 bool aaSrcdHasX264Support() {
@@ -217,12 +221,12 @@ bool aaSrcdHasX264Support() {
 #endif
 }
 
-LiveEncodeSource::LiveEncodeSource(int width, int height, int fps, int bitrateKbps, Renderer& renderer): m_impl(nullptr) {
+LiveEncodeSource::LiveEncodeSource(int width, int height, int fps, int bitrateKbps, Renderer& renderer, const DashboardState& state): m_impl(nullptr) {
 #ifndef AA_SRCD_HAVE_X264
-    (void)width; (void)height; (void)fps; (void)bitrateKbps; (void)renderer;
+    (void)width; (void)height; (void)fps; (void)bitrateKbps; (void)renderer; (void)state;
     fprintf(stderr, "this build has no x264 support, cannot render live\n");
 #else
-    m_impl = new Impl(renderer);
+    m_impl = new Impl(renderer, state);
     m_impl->width = width;
     m_impl->height = height;
 
@@ -297,7 +301,13 @@ bool LiveEncodeSource::nextPicture(std::vector<uint8_t>& annexB, bool& keyframe)
         return false;
     }
 
-    m_impl->renderer.draw(m_impl->surface.data(), m_impl->width, m_impl->height, m_impl->frameIndex++);
+    RenderContext context;
+    context.width = m_impl->width;
+    context.height = m_impl->height;
+    context.frameIndex = m_impl->frameIndex++;
+    context.state = &m_impl->state;
+
+    m_impl->renderer.draw(m_impl->surface.data(), context);
     convertArgbToI420(m_impl->surface, m_impl->pictureIn.img.plane, m_impl->pictureIn.img.i_stride, m_impl->width, m_impl->height);
     m_impl->pictureIn.i_type = X264_TYPE_AUTO;
 

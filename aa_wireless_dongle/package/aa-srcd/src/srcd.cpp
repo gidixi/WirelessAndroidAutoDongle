@@ -2,9 +2,11 @@
 //
 // It enumerates as an accessory device through the f_accessory gadget, completes
 // the head unit handshake (version, TLS, auth, service discovery, channel open,
-// AV setup) and then streams a pre-encoded H.264 stream to the car screen. The
-// first target is a static dashboard, so the encoder is offline and this daemon
-// only replays GOPs from a file.
+// AV setup) and then streams video to the car screen. Video comes either from a
+// pre-encoded file (--h264) or from rendering the LVGL dashboard and encoding it
+// on the fly (--live). The display mode is whatever the head unit confirmed, so
+// the encoder size follows the car, not a hard-coded value.
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -19,6 +21,9 @@
 
 #include "certs.h"
 #include "framesource.h"
+#ifdef AA_SRCD_HAVE_LVGL
+#include "lvglrenderer.h"
+#endif
 #include "messenger.h"
 #include "pbwire.h"
 #include "transport.h"
@@ -87,8 +92,22 @@ struct Options {
     bool timestampedMedia = false;
     size_t maxFramePayload = 32768;
     bool debug = false;
+    std::string ui = "auto";         // auto | lvgl | pattern
     std::string deviceName = "Android";
     std::string deviceBrand = "aa-srcd";
+};
+
+// One display mode the head unit said it can decode. The position inside the
+// advertised list is what AVChannelStartIndication's config field refers to.
+struct VideoMode {
+    int resolutionEnum = 0;
+    int fpsEnum = 0;
+    int width = 0;
+    int height = 0;
+    int fps = 0;
+    int dpi = 0;
+    int marginWidth = 0;
+    int marginHeight = 0;
 };
 
 struct ChannelInfo {
@@ -98,10 +117,33 @@ struct ChannelInfo {
     bool hasInput = false;
     bool hasSensor = false;
     std::vector<int> sensorTypes;
-    int videoResolution = 0;
-    int videoFps = 0;
-    int dpi = 0;
+    std::vector<VideoMode> videoModes;
 };
+
+// VideoResolution enum as documented by open-android-auto (values 5-9 were wrong
+// in the aasdk-era definitions).
+bool videoModeSize(int resolutionEnum, int& width, int& height) {
+    switch (resolutionEnum) {
+        case 1: width = 800;   height = 480;   return true;
+        case 2: width = 1280;  height = 720;   return true;
+        case 3: width = 1920;  height = 1080;  return true;
+        case 4: width = 2560;  height = 1440;  return true;
+        case 5: width = 3840;  height = 2160;  return true;
+        case 6: width = 720;   height = 1280;  return true;
+        case 7: width = 1080;  height = 1920;  return true;
+        case 8: width = 1440;  height = 2560;  return true;
+        case 9: width = 2160;  height = 3840;  return true;
+        default: return false;
+    }
+}
+
+int videoFpsFromEnum(int fpsEnum) {
+    switch (fpsEnum) {
+        case 1: return 60;
+        case 2: return 30;
+        default: return 0;     // unknown: do not cap our own rate
+    }
+}
 
 uint64_t nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -150,19 +192,25 @@ public:
         messenger.setMaxFramePayload(m_options.maxFramePayload);
 
         if (m_options.live) {
-            m_source = std::make_unique<LiveEncodeSource>(m_options.width, m_options.height, m_options.fps,
-                m_options.bitrateKbps, m_renderer);
+            if (!aaSrcdHasX264Support()) {
+                fprintf(stderr, "this build has no x264 support, cannot render live\n");
+                return 1;
+            }
+            // The encoder size depends on the display mode the head unit picks, so
+            // the live source waits for the AV setup response.
+            m_streamFps = m_options.fps;
         }
         else {
             m_source = std::make_unique<H264FileSource>(m_options.h264Path);
+            if (!m_source || !m_source->isReady()) {
+                fprintf(stderr, "no video to send: use --h264 <file> or --live\n");
+                return 1;
+            }
+            fprintf(stderr, "video source ready: %s\n", m_source->name());
         }
 
-        if (!m_source || !m_source->isReady()) {
-            fprintf(stderr, "no video to send: use --h264 <file> or --live\n");
-            return 1;
-        }
-
-        fprintf(stderr, "video source ready: %s\n", m_source->name());
+        m_dashboard.sessionStartMs = nowMs();
+        m_nextFrameMs = nowMs();
 
         struct pollfd pfd;
         pfd.fd = transport->fd();
@@ -362,15 +410,23 @@ private:
                     std::vector<pb::Field> configFields;
                     pb::parse((const uint8_t*)videoConfig->bytes.data(), videoConfig->bytes.size(), configFields);
 
+                    VideoMode mode;
                     const pb::Field* resolution = pb::find(configFields, 1);
                     const pb::Field* fps = pb::find(configFields, 2);
+                    const pb::Field* marginWidth = pb::find(configFields, 3);
+                    const pb::Field* marginHeight = pb::find(configFields, 4);
                     const pb::Field* dpi = pb::find(configFields, 5);
 
+                    mode.resolutionEnum = resolution ? (int)resolution->value : 0;
+                    mode.fpsEnum = fps ? (int)fps->value : 0;
+                    mode.marginWidth = marginWidth ? (int)marginWidth->value : 0;
+                    mode.marginHeight = marginHeight ? (int)marginHeight->value : 0;
+                    mode.dpi = dpi ? (int)dpi->value : 0;
+                    mode.fps = videoFpsFromEnum(mode.fpsEnum);
+                    videoModeSize(mode.resolutionEnum, mode.width, mode.height);
+
                     info.hasVideoConfigs = true;
-                    info.videoResolution = resolution ? (int)resolution->value : 0;
-                    info.videoFps = fps ? (int)fps->value : 0;
-                    info.dpi = dpi ? (int)dpi->value : 0;
-                    break;
+                    info.videoModes.push_back(mode);
                 }
 
                 info.hasAudioConfigs = !pb::findAll(avFields, 3).empty();
@@ -379,13 +435,16 @@ private:
             fprintf(stderr, "  channel %d:%s%s%s%s", info.channelId,
                 info.hasVideoConfigs ? " video" : "", info.hasAudioConfigs ? " audio" : "",
                 info.hasInput ? " input" : "", info.hasSensor ? " sensor" : "");
-            if (info.hasVideoConfigs) {
-                fprintf(stderr, " (resolution=%d fps=%d dpi=%d)", info.videoResolution, info.videoFps, info.dpi);
+            for (const VideoMode& mode: info.videoModes) {
+                fprintf(stderr, " [%dx%d %dfps dpi=%d margins=%dx%d]", mode.width, mode.height, mode.fps, mode.dpi,
+                    mode.marginWidth, mode.marginHeight);
             }
             fprintf(stderr, "\n");
 
             if (info.hasVideoConfigs && m_videoChannelId < 0) {
                 m_videoChannelId = info.channelId;
+                m_videoModes = info.videoModes;
+                selectVideoMode();
             }
             else if (info.hasSensor && m_sensorChannelId < 0) {
                 m_sensorChannelId = info.channelId;
@@ -464,6 +523,7 @@ private:
                     bool value = isNight && isNight->value != 0;
                     if (value != m_nightMode) {
                         m_nightMode = value;
+                        m_dashboard.nightMode = value;
                         fprintf(stderr, "night mode: %s\n", m_nightMode ? "night" : "day");
                     }
                 }
@@ -474,6 +534,7 @@ private:
                     const pb::Field* status = pb::find(fields, 1);
                     if (status) {
                         m_drivingStatus = (int)status->value;
+                        m_dashboard.drivingStatus = (int)status->value;
                     }
                 }
                 break;
@@ -495,11 +556,18 @@ private:
 
                 int statusValue = status ? (int)status->value : 0;
                 m_maxUnacked = maxUnacked && maxUnacked->value > 0 ? (int)maxUnacked->value : 8;
-                m_configIndex = !configs.empty() ? (int)configs[0]->value : 0;
+                m_configIndex = !configs.empty() ? (int)configs[0]->value : m_selectedModeIndex;
 
                 fprintf(stderr, "AV setup response: status=%d max_unacked=%d config=%d\n", statusValue, m_maxUnacked, m_configIndex);
 
                 if (statusValue != AV_SETUP_STATUS_OK) {
+                    m_state = State::Stopped;
+                    return;
+                }
+
+                applyVideoMode(m_configIndex);
+
+                if (m_options.live && !createLiveSource()) {
                     m_state = State::Stopped;
                     return;
                 }
@@ -548,7 +616,7 @@ private:
         }
 
         uint64_t now = nowMs();
-        uint64_t intervalMs = 1000 / (m_options.fps > 0 ? m_options.fps : 1);
+        uint64_t intervalMs = 1000 / (m_streamFps > 0 ? m_streamFps : 1);
 
         while (m_outstanding < m_maxUnacked && now >= m_nextFrameMs) {
             std::vector<uint8_t> picture;
@@ -623,7 +691,103 @@ private:
     int m_configIndex = 0;
 
     std::unique_ptr<FrameSource> m_source;
-    TestPatternRenderer m_renderer;
+    std::unique_ptr<Renderer> m_renderer;
+    DashboardState m_dashboard;
+    std::vector<VideoMode> m_videoModes;
+    int m_selectedModeIndex = -1;
+    int m_streamFps = 5;
+
+    // Pick the advertised mode we would rather drive: an exact match with what the
+    // operator asked for, otherwise the first landscape mode within reach.
+    void selectVideoMode() {
+        m_selectedModeIndex = -1;
+
+        for (size_t index = 0; index < m_videoModes.size(); index++) {
+            if (m_videoModes[index].width == m_options.width && m_videoModes[index].height == m_options.height) {
+                m_selectedModeIndex = (int)index;
+                break;
+            }
+        }
+
+        if (m_selectedModeIndex < 0) {
+            for (size_t index = 0; index < m_videoModes.size(); index++) {
+                const VideoMode& mode = m_videoModes[index];
+                if (mode.width >= mode.height && mode.width > 0 && mode.width <= 1920) {
+                    m_selectedModeIndex = (int)index;
+                    break;
+                }
+            }
+        }
+
+        if (m_selectedModeIndex < 0) {
+            fprintf(stderr, "none of the %zu advertised display modes is usable by this build\n", m_videoModes.size());
+        }
+        else {
+            const VideoMode& mode = m_videoModes[m_selectedModeIndex];
+            fprintf(stderr, "selected display mode %d: %dx%d at %d fps, dpi %d\n", m_selectedModeIndex,
+                mode.width, mode.height, mode.fps, mode.dpi);
+        }
+    }
+
+    void applyVideoMode(int configIndex) {
+        const VideoMode* mode = nullptr;
+        if (configIndex >= 0 && configIndex < (int)m_videoModes.size()) {
+            mode = &m_videoModes[configIndex];
+        }
+        else if (m_selectedModeIndex >= 0) {
+            mode = &m_videoModes[m_selectedModeIndex];
+        }
+
+        if (!mode || mode->width <= 0) {
+            m_dashboard.videoWidth = m_options.width;
+            m_dashboard.videoHeight = m_options.height;
+            m_dashboard.videoFps = m_options.fps;
+            fprintf(stderr, "the head unit did not name a display mode we recognise, using %dx%d\n",
+                m_dashboard.videoWidth, m_dashboard.videoHeight);
+            return;
+        }
+
+        m_dashboard.videoWidth = mode->width;
+        m_dashboard.videoHeight = mode->height;
+        m_dashboard.videoFps = mode->fps > 0 ? std::min(m_options.fps, mode->fps) : m_options.fps;
+        m_streamFps = m_dashboard.videoFps;
+
+        fprintf(stderr, "streaming %dx%d at %d fps (mode margins %dx%d)\n", m_dashboard.videoWidth,
+            m_dashboard.videoHeight, m_streamFps, mode->marginWidth, mode->marginHeight);
+    }
+
+    bool createLiveSource() {
+        int width = m_dashboard.videoWidth;
+        int height = m_dashboard.videoHeight;
+        int fps = m_streamFps > 0 ? m_streamFps : m_options.fps;
+
+        bool useLvgl;
+#ifdef AA_SRCD_HAVE_LVGL
+        useLvgl = m_options.ui != "pattern";
+        if (useLvgl) {
+            m_renderer = std::make_unique<LvglRenderer>(width, height);
+        }
+#else
+        if (m_options.ui == "lvgl") {
+            fprintf(stderr, "this build has no LVGL support\n");
+            return false;
+        }
+        useLvgl = false;
+#endif
+        if (!useLvgl) {
+            m_renderer = std::make_unique<TestPatternRenderer>();
+        }
+
+        m_source = std::make_unique<LiveEncodeSource>(width, height, fps, m_options.bitrateKbps, *m_renderer, m_dashboard);
+        if (!m_source->isReady()) {
+            fprintf(stderr, "cannot start the live encoder\n");
+            return false;
+        }
+
+        fprintf(stderr, "live source ready: %s + %s at %dx%d\n", m_source->name(), useLvgl ? "lvgl" : "test pattern",
+            width, height);
+        return true;
+    }
     uint64_t m_nextFrameMs = 0;
     uint64_t m_nextPingMs = 0;
     uint64_t m_framesSent = 0;
@@ -635,6 +799,7 @@ void printUsage(const char* argv0) {
            "  --live              render and encode on the fly (test pattern for now)\n"
            "  --size WxH          live resolution, default 800x480\n"
            "  --bitrate <kbps>    live bitrate, default 1200\n"
+           "  --ui lvgl|pattern   dashboard renderer for --live, default lvgl when built in\n"
            "  --fps <n>           playback rate, default 5\n"
            "  --tcp <port>        bench mode: wait for a head unit over TCP instead of USB\n"
            "  --timestamped       send media frames with the timestamped indication\n"
@@ -668,6 +833,9 @@ int main(int argc, char** argv) {
         else if (arg == "--bitrate" && i + 1 < argc) {
             options.bitrateKbps = atoi(argv[++i]);
         }
+        else if (arg == "--ui" && i + 1 < argc) {
+            options.ui = argv[++i];
+        }
         else if (arg == "--max-frame" && i + 1 < argc) {
             options.maxFramePayload = (size_t)atoi(argv[++i]);
         }
@@ -688,6 +856,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Source source(std::move(options));
-    return source.run();
+    // On USB the daemon owns the accessory node for as long as the car is
+    // attached: one session ending (unplug, SHUTDOWN_REQUEST, decoder hiccup)
+    // must not end the process, otherwise nothing answers the next ignition
+    // cycle. Bench sessions over --tcp stay single-shot on purpose.
+    int status = 0;
+    do {
+        Source source(options);
+        status = source.run();
+
+        if (!options.useUsb) {
+            break;
+        }
+
+        fprintf(stderr, "session ended, waiting for the next head unit\n");
+        sleep(1);
+    } while (true);
+
+    return status;
 }
